@@ -33,6 +33,7 @@
 ---
 
 ## Project Structure
+```bash
 project_labour_management/
 │
 ├── data/                        # เก็บไฟล์ CSV, Excel, หรือ mock data
