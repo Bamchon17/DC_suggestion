@@ -1,35 +1,17 @@
+# manday_calculation/utils.py
 import sys
 import os
 import re
 import difflib
 import pandas as pd
 import numpy as np
-import psycopg2
 from collections import defaultdict
-from dotenv import load_dotenv
 import google.generativeai as genai
-from sqlalchemy import create_engine, text
-import uuid
 
-# -------------------- Path & ENV --------------------
+# -------------------- Path --------------------
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.append(BASE_DIR)
-from db.connection import conn  # expects a `conn` psycopg2 connection
-
-load_dotenv("db/.env")
-
-# ดึงค่าจาก .env
-DB_HOST = os.getenv("DB_HOST")
-DB_NAME = os.getenv("DB_NAME")
-DB_PORT = os.getenv("DB_PORT")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-
-# สร้าง Connection URL สำหรับ Postgres (Neon ใช้ sslmode=require)
-DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?sslmode=require"
-
-# สร้าง engine
-engine = create_engine(DATABASE_URL)
+from db.connection import conn  # ใช้การเชื่อมต่อจาก connection.py
 
 # -------------------- Gemini --------------------
 API_KEY = os.getenv("gemini_api_key")
@@ -88,7 +70,7 @@ def best_string_match(term: str, choices: list[str], cutoff_exact: float = 0.999
         return choices[low.index(matches[0])]
     return None
 
-# -------------------- DB Helpers --------------------
+# manday_calculation/skill_matching.py
 def fetch_query(conn, query, columns=None):
     try:
         cur = conn.cursor()
@@ -100,7 +82,6 @@ def fetch_query(conn, query, columns=None):
         print(f"Error executing query: {e}")
         return pd.DataFrame()
 
-# -------------------- Queries --------------------
 worker_query = """
 SELECT  
     w.worker_id,
@@ -128,19 +109,11 @@ JOIN tasks AS t ON t.project_id = pr.project_id
 JOIN subtask AS st ON st.task_id = t.task_id
 """
 
-work_standard_query = """
-SELECT task_name, standard_rate, unit
-FROM work_standard
-"""
-
-# -------------------- Skill level parsing --------------------
-INT_OR_FLOAT = re.compile(r"(\d+(?:\.\d+)?)")
-
 def parse_skill_level(val):
     text = str(val).strip() if not pd.isna(val) else ""
     if re.search(r"ทดลอง|ฝึกงาน|intern", text, re.IGNORECASE):
         return 0.0, "U"
-    m = INT_OR_FLOAT.search(text)
+    m = re.compile(r"(\d+(?:\.\d+)?)").search(text)
     num = float(m.group(1)) if m else None
     suffix = ""
     if m:
@@ -156,7 +129,6 @@ def clean_skill_level(df_skills: pd.DataFrame) -> pd.DataFrame:
     df_skills["skill_level_suffix"] = parsed.apply(lambda x: x[1])
     return df_skills[df_skills["skill_level_num"].notna()]
 
-# -------------------- Gemini Matching --------------------
 def match_skills_to_tasks(worker_skills_df: pd.DataFrame, project_df: pd.DataFrame, model: genai.GenerativeModel) -> pd.DataFrame:
     skills_pool = (
         worker_skills_df["skill_name"].dropna().astype(str).map(normalize_text).str.lower().unique().tolist()
@@ -245,7 +217,6 @@ def match_skills_to_tasks(worker_skills_df: pd.DataFrame, project_df: pd.DataFra
         suffixes=("", "_pj")
     )
 
-    # Preserve task_id and subtask_id from project_df if merge overwrites with None
     df["task_id"] = df.apply(
         lambda row: row["task_id_pj"] if pd.isna(row["task_id"]) and not pd.isna(row["task_id_pj"]) else row["task_id"],
         axis=1
@@ -258,6 +229,12 @@ def match_skills_to_tasks(worker_skills_df: pd.DataFrame, project_df: pd.DataFra
     df = df.drop(columns=["sub_task_name", "task_id_pj", "subtask_id_pj"], errors="ignore")
     print(f"match_skills_to_tasks output shape: {df.shape}, task_id nulls: {df['task_id'].isna().sum()}, subtask_id nulls: {df['subtask_id'].isna().sum()}")
     return df
+
+# manday_calculation/standard_matching.py
+work_standard_query = """
+SELECT task_name, standard_rate, unit
+FROM work_standard
+"""
 
 def match_standards_to_tasks(project_df: pd.DataFrame, standard_df: pd.DataFrame, model: genai.GenerativeModel) -> pd.DataFrame:
     std_pool = standard_df["task_name"].dropna().astype(str).map(normalize_text).str.lower().unique().tolist()
@@ -319,7 +296,9 @@ def match_standards_to_tasks(project_df: pd.DataFrame, standard_df: pd.DataFrame
     print(f"match_standards_to_tasks output shape: {df.shape}")
     return df
 
-# -------------------- Assignment --------------------
+# manday_calculation/assignment.py
+import uuid
+
 def assign_workers(df_tasks: pd.DataFrame, worker_df: pd.DataFrame) -> pd.DataFrame:
     w = worker_df.copy()
     w["skill_name"] = w["skill_name"].map(lambda s: normalize_text(s).lower())
@@ -356,10 +335,9 @@ def assign_workers(df_tasks: pd.DataFrame, worker_df: pd.DataFrame) -> pd.DataFr
             for cand in candidate_pool:
                 if cand["worker_name"] in used_workers:
                     continue
-                # Calculate planned_hours as durations_subtask * 8 hours
                 planned_hours = r.get("durations_subtask", 0) * 8 if pd.notna(r.get("durations_subtask")) and r.get("durations_subtask", 0) > 0 else 8
                 out_rows.append({
-                    "assignment_id": str(uuid.uuid4()),  # Generate unique assignment_id
+                    "assignment_id": str(uuid.uuid4()),
                     "task_name": r.get("task_name"),
                     "sub_task": r.get("sub_task"),
                     "matched_skill": matched if matched else "ไม่สามารถจับคู่ได้",
@@ -384,10 +362,9 @@ def assign_workers(df_tasks: pd.DataFrame, worker_df: pd.DataFrame) -> pd.DataFr
                 if assigned_count >= needed:
                     break
         if assigned_count < needed:
-            # Calculate planned_hours as durations_subtask * 8 hours for unassigned tasks
             planned_hours = r.get("durations_subtask", 0) * 8 if pd.notna(r.get("durations_subtask")) and r.get("durations_subtask", 0) > 0 else 8
             out_rows.append({
-                "assignment_id": str(uuid.uuid4()),  # Generate unique assignment_id
+                "assignment_id": str(uuid.uuid4()),
                 "task_name": r.get("task_name"),
                 "sub_task": r.get("sub_task"),
                 "matched_skill": matched if matched else "ไม่สามารถจับคู่ได้",
@@ -398,7 +375,7 @@ def assign_workers(df_tasks: pd.DataFrame, worker_df: pd.DataFrame) -> pd.DataFr
                 "durations_subtask": r.get("durations_subtask"),
                 "standard_rate": r.get("standard_rate"),
                 "workers_needed": needed,
-                "worker_id": None,  # Use None for unassigned workers
+                "worker_id": None,
                 "worker_name": "ไม่สามารถจับคู่ได้",
                 "evaluation": np.nan,
                 "project_id": r.get("project_id"),
@@ -412,7 +389,10 @@ def assign_workers(df_tasks: pd.DataFrame, worker_df: pd.DataFrame) -> pd.DataFr
     print(f"assign_workers output shape: {df_assigned.shape}, task_id nulls: {df_assigned['task_id'].isna().sum()}, subtask_id nulls: {df_assigned['subtask_id'].isna().sum()}")
     return df_assigned
 
-# -------------------- Pipeline --------------------
+# manday_calculation/pipeline.py
+import os
+from sqlalchemy import create_engine, text
+
 if __name__ == "__main__":
     print("📥 Loading data from database …")
     worker_df = fetch_query(
@@ -451,7 +431,6 @@ if __name__ == "__main__":
     df_merged = df_skills.merge(df_std, on=["task_name", "sub_task"], how="left")
     print(f"df_merged shape: {df_merged.shape}, task_id nulls: {df_merged['task_id'].isna().sum()}, subtask_id nulls: {df_merged['subtask_id'].isna().sum()}")
 
-    # Calculate workers_needed (from provided code)
     df_merged["qty"] = pd.to_numeric(df_merged["qty"], errors="coerce")
     df_merged["standard_rate"] = pd.to_numeric(df_merged["standard_rate"], errors="coerce")
     df_merged["durations_subtask"] = pd.to_numeric(df_merged["durations_subtask"], errors="coerce")
@@ -486,9 +465,10 @@ if __name__ == "__main__":
 
     worker_ids = df_assigned[df_assigned["worker_id"].notna()]["worker_id"].unique().tolist()
 
-    with engine.begin() as conn:
+    engine = create_engine(f"postgresql+psycopg2://{conn.dsn['user']}:{conn.dsn['password']}@{conn.dsn['host']}:{conn.dsn['port']}/{conn.dsn['database']}?sslmode=require")
+    with engine.begin() as conn_sql:
         if worker_ids:
-            conn.execute(
+            conn_sql.execute(
                 text("""
                     UPDATE worker_status
                     SET status = 'ไม่ว่าง'
@@ -498,10 +478,8 @@ if __name__ == "__main__":
             )
             print(f"Updated worker_status for {len(worker_ids)} workers to 'ไม่ว่าง'")
 
-    # Prepare data for Worker_Assignment table
     df_to_upload = df_assigned[["assignment_id", "worker_id", "project_id", "task_id", "subtask_id", "start_date", "end_date", "planned_hours", "assigned_by"]].copy()
 
-    # Ensure data types match the Worker_Assignment table schema
     df_to_upload["assignment_id"] = df_to_upload["assignment_id"].astype(str)
     df_to_upload["worker_id"] = df_to_upload["worker_id"].astype(str, errors="ignore").replace("nan", None)
     df_to_upload["project_id"] = df_to_upload["project_id"].astype(str, errors="ignore").replace("nan", None)
@@ -512,24 +490,20 @@ if __name__ == "__main__":
     df_to_upload["planned_hours"] = pd.to_numeric(df_to_upload["planned_hours"], errors="coerce")
     df_to_upload["assigned_by"] = df_to_upload["assigned_by"].astype(str)
 
-    # Log rows with null task_id or subtask_id
     null_task_ids = df_to_upload[df_to_upload["task_id"].isna()]
     null_subtask_ids = df_to_upload[df_to_upload["subtask_id"].isna()]
     if not null_task_ids.empty:
         print(f"⚠️ {len(null_task_ids)} rows with null task_id: {null_task_ids[['task_name', 'sub_task']].to_dict('records')}")
     if not null_subtask_ids.empty:
         print(f"⚠️ {len(null_subtask_ids)} rows with null subtask_id: {null_subtask_ids[['task_name', 'sub_task']].to_dict('records')}")
-    
-    # Drop rows with null task_id, subtask_id, or project_id to satisfy foreign key constraints
+
     df_to_upload = df_to_upload.dropna(subset=["project_id", "task_id", "subtask_id"])
     print(f"df_to_upload shape after dropping nulls: {df_to_upload.shape}")
 
-    # Verify foreign key constraints
-    with engine.begin() as conn:
-        # Check if task_id and subtask_id exist in Tasks and Subtask tables
-        valid_task_ids = conn.execute(text("SELECT task_id FROM Tasks")).fetchall()
+    with engine.begin() as conn_sql:
+        valid_task_ids = conn_sql.execute(text("SELECT task_id FROM Tasks")).fetchall()
         valid_task_ids = {row[0] for row in valid_task_ids}
-        valid_subtask_ids = conn.execute(text("SELECT subtask_id FROM Subtask")).fetchall()
+        valid_subtask_ids = conn_sql.execute(text("SELECT subtask_id FROM Subtask")).fetchall()
         valid_subtask_ids = {row[0] for row in valid_subtask_ids}
 
         invalid_tasks = df_to_upload[~df_to_upload["task_id"].isin(valid_task_ids)]
@@ -538,11 +512,9 @@ if __name__ == "__main__":
             print(f"⚠️ Invalid task_ids: {invalid_tasks['task_id'].unique().tolist()}")
         if not invalid_subtasks.empty:
             print(f"⚠️ Invalid subtask_ids: {invalid_subtasks['subtask_id'].unique().tolist()}")
-        
-        # Filter out invalid IDs
+
         df_to_upload = df_to_upload[df_to_upload["task_id"].isin(valid_task_ids) & df_to_upload["subtask_id"].isin(valid_subtask_ids)]
 
-    # อัปโหลดเข้า Neon DB
     try:
         df_to_upload.to_sql(
             name="Worker_Assignment",
