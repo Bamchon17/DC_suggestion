@@ -1,50 +1,82 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from db.connection import get_connection
+from psycopg2.extras import execute_batch
 
-# ดึง worker_assignment ทั้งหมด
+# ---------------- DB ----------------
 conn = get_connection()
-assignments = pd.read_sql("SELECT * FROM worker_assignment", conn)
+
+# ดึง assignment + qty
+query = """
+SELECT wa.*, s.qty
+FROM worker_assignment wa
+LEFT JOIN subtask s ON wa.subtask_id = s.subtask_id
+"""
+assignments = pd.read_sql(query, conn)
 workers = pd.read_sql("SELECT * FROM worker", conn)
 
-# check missing worker_id
+# ตรวจสอบ worker_id
 assignments = assignments[assignments['worker_id'].isin(workers['worker_id'])]
 
-
-# ตรวจสอบ columns ที่จำเป็น
+# ตรวจสอบ columns
 required_cols = ['assignment_id', 'worker_id', 'project_id', 'task_id', 'subtask_id', 
                  'start_date', 'end_date', 'planned_hours', 'assigned_by']
 missing = [c for c in required_cols if c not in assignments.columns]
 if missing:
     raise ValueError(f"Missing columns in worker_assignment: {missing}")
 
-# ฟังก์ชันสร้าง worklog สำหรับแต่ละ assignment
-def generate_worklog(row, log_counter):
+# default qty
+if 'qty' not in assignments.columns:
+    assignments['qty'] = 100
+
+# ---------------- Worklog Generator ----------------
+def generate_worklog(row, log_counter, productivity_rate=5, work_days_ratio=0.8):
     worklogs = []
-    start_date = pd.to_datetime(row['start_date'])
-    end_date = pd.to_datetime(row['end_date'])
+    start_date = pd.to_datetime(row['start_date']) if pd.notnull(row['start_date']) else pd.Timestamp.today()
+    end_date = pd.to_datetime(row['end_date']) if pd.notnull(row['end_date']) else start_date
+
     planned_hours = float(row['planned_hours'])
-    
-    # จำนวนวันทั้งหมด
+    qty_total = float(row['qty']) if pd.notnull(row['qty']) else 100
+
     total_days = max((end_date - start_date).days + 1, 1)
-    work_days = min(np.random.randint(3, 6), total_days)  # 3-5 วัน หรือเต็มช่วง
-    
-    all_dates = pd.date_range(start_date, end_date)
-    selected_dates = sorted(np.random.choice(all_dates, size=work_days, replace=False))
-    
+    work_days = min(int(total_days * work_days_ratio), total_days)
+    if work_days <= 0:
+        return worklogs, log_counter
+
+    all_dates = pd.date_range(start_date, end_date, freq='B')
+    if len(all_dates) > work_days:
+        indices = np.linspace(0, len(all_dates) - 1, work_days, dtype=int)
+        selected_dates = all_dates[indices]
+    else:
+        selected_dates = all_dates
+
+    hours_per_day = planned_hours / work_days
     remaining_hours = planned_hours
-    for i, log_date in enumerate(selected_dates):
-        # random hours worked 4–8 ชั่วโมง
-        hours = round(min(np.random.uniform(4, 8), remaining_hours), 2)
-        remaining_hours -= hours
+    remaining_units = qty_total
+
+    for log_date in selected_dates:
+        hours = round(
+            min(
+                np.random.uniform(max(hours_per_day*0.8, 4), min(hours_per_day*1.2, 8)),
+                remaining_hours
+            ),
+            2
+        )
         if hours <= 0:
             break
 
-        # random unit_completed 10–30 units
-        units = int(np.random.uniform(10, 31))
+        units = round(
+            min(
+                hours * productivity_rate * np.random.uniform(0.8, 1.2),
+                remaining_units
+            ),
+            2
+        )
+        if units <= 0:
+            break
 
-        log_id = f'LOG{log_counter:04d}'
+        log_id = f"LOG{log_counter:05d}"
         log_counter += 1
 
         worklogs.append({
@@ -58,30 +90,34 @@ def generate_worklog(row, log_counter):
             'hours_worked': hours
         })
 
-        if remaining_hours <= 0:
+        remaining_hours -= hours
+        remaining_units -= units
+
+        if remaining_hours <= 0 or remaining_units <= 0:
             break
 
     return worklogs, log_counter
 
-# สร้าง worklog สำหรับทุก assignment
+# ---------------- MAIN ----------------
 worklog_list = []
 log_counter = 1
+
 for _, row in assignments.iterrows():
-    worklogs, log_counter = generate_worklog(row, log_counter)
+    worklogs, log_counter = generate_worklog(row, log_counter, productivity_rate=5, work_days_ratio=0.8)
     worklog_list.extend(worklogs)
 
 worklog_df = pd.DataFrame(worklog_list)
 
-# Insert batch เข้า DB
-from psycopg2.extras import execute_batch
+# Insert batch
 cur = conn.cursor()
 insert_query = """
 INSERT INTO worklog (log_id, worker_id, project_id, task_id, subtask_id, unit_completed, log_date, hours_worked)
 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
 """
-data = worklog_df[['log_id','worker_id','project_id','task_id','subtask_id','unit_completed','log_date','hours_worked']].values.tolist()
+data = worklog_df[['log_id', 'worker_id', 'project_id', 'task_id', 'subtask_id', 'unit_completed', 'log_date', 'hours_worked']].values.tolist()
 execute_batch(cur, insert_query, data, page_size=100)
 conn.commit()
 cur.close()
+conn.close()
 
 print(f"Inserted {len(worklog_df)} worklog records.")
