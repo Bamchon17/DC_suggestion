@@ -59,3 +59,5 @@ pip install -r requirements.txt
 - **เวอร์ชัน**: ถ้ามีการอัปเดตในอนาคต อาจเพิ่มส่วน "Changelog"
 - **ลิขสิทธิ์**: ถ้าต้องการ อาจเพิ่มส่วน "License"
 
+
+run:  python -m core.manday_calculation.pipeline
